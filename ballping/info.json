@@ -1,0 +1,14 @@
+{
+  "author": ["YourName"],
+  "name": "BallPing",
+  "short": "Identify Ballsdex spawns from their art and ping the people who want them.",
+  "description": "Watches configured Ballsdex bots for spawn images, identifies the countryball using perceptual hashing (ported from Meff1u/BallIdentifier, MIT), and pings per-server subscribed members or roles. Bot owners can upload new spawn art to teach it new or updated balls.",
+  "end_user_data_statement": "This cog stores Discord user and role IDs that server admins subscribe to ball pings, and the Discord ID of the bot owner who uploaded each extra spawn-art image. Uploaded art images are stored in the cog's data folder. Message contents are not stored. Users can request deletion of their stored IDs.",
+  "install_msg": "Thanks for installing BallPing! Start with `[p]help ballping`. Hash data and algorithm credit: Meff1u/BallIdentifier (MIT).",
+  "min_bot_version": "3.5.0",
+  "requirements": ["Pillow", "numpy"],
+  "tags": ["ballsdex", "countryballs", "notifier", "spawn"],
+  "type": "COG",
+  "hidden": false,
+  "disabled": false
+}
