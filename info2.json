@@ -1,0 +1,7 @@
+{
+  "author": ["YourName"],
+  "description": "Red-DiscordBot cogs by YourName.",
+  "install_msg": "Thanks for adding my repo! Install a cog with `[p]cog install <repo name> <cog name>`.",
+  "short": "Cogs by YourName",
+  "tags": ["ballsdex", "countryballs"]
+}
