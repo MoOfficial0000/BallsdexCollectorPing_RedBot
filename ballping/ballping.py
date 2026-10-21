@@ -3,11 +3,14 @@ import difflib
 import io
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from urllib.parse import urlparse
 
+import aiohttp
 import discord
 import numpy as np
 from PIL import Image, ImageOps
@@ -34,6 +37,62 @@ class Index(NamedTuple):
     names: List[str]  # one entry per stored hash (a ball can have several)
     matrix: np.ndarray  # shape (len(names), HASH_LEN), uint8 hex characters
     lookup: Dict[str, str]  # lowercase name -> canonical name
+
+
+class FetchError(Exception):
+    """Raised when an image can't be downloaded."""
+
+
+class Source(NamedTuple):
+    kind: str  # "attachment", "embed image", "embed thumbnail" or "component"
+    url: str
+    filename: str
+    attachment: Optional[discord.Attachment] = None
+
+
+DISCORD_HOSTS = ("discordapp.com", "discordapp.net", "discord.com")
+
+
+def _is_discord_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme in ("http", "https") and any(
+        host == d or host.endswith("." + d) for d in DISCORD_HOSTS
+    )
+
+
+def _name_from_url(url: str) -> str:
+    return os.path.basename(urlparse(url).path) or "image.png"
+
+
+def _is_interaction_response(message: discord.Message) -> bool:
+    """True for replies to slash commands/buttons (e.g. a collection embed), never for spawns."""
+    if hasattr(message, "interaction_metadata"):
+        return message.interaction_metadata is not None
+    return getattr(message, "interaction", None) is not None
+
+
+def _walk(node, media: List[Tuple[str, str]], names: List[str], depth: int = 0) -> None:
+    """Collect media URLs and component type names from a message's components.
+
+    Duck-typed on purpose: Discord's newer layout components differ between discord.py versions.
+    """
+    if node is None or depth > 6:
+        return
+    if isinstance(node, (list, tuple)):
+        for child in node:
+            _walk(child, media, names, depth)
+        return
+    names.append(type(node).__name__)
+    item = getattr(node, "media", None)
+    url = getattr(item, "proxy_url", None) or getattr(item, "url", None)
+    if url:
+        media.append((url, _name_from_url(url)))
+    for attr in ("children", "items", "components"):
+        child = getattr(node, attr, None)
+        if isinstance(child, (list, tuple)):
+            _walk(child, media, names, depth + 1)
+    _walk(getattr(node, "accessory", None), media, names, depth + 1)
 
 
 def image_hash(data: bytes) -> str:
@@ -101,11 +160,17 @@ class BallPing(commands.Cog):
         self._base: Dict[str, str] = {}
         self._index: Optional[Index] = None
         self._index_lock = asyncio.Lock()
+        self._session: Optional[aiohttp.ClientSession] = None
 
     async def cog_load(self) -> None:
+        self._session = aiohttp.ClientSession()
         path = bundled_data_path(self) / "BallsdexHashes.json"
         self._base = await self.bot.loop.run_in_executor(None, _load_json, path)
         await self._rebuild_index()
+
+    async def cog_unload(self) -> None:
+        if self._session is not None:
+            await self._session.close()
 
     # ------------------------------------------------------------------ index
 
@@ -166,35 +231,112 @@ class BallPing(commands.Cog):
 
     @staticmethod
     def _is_image(att: discord.Attachment) -> bool:
-        return (att.content_type or "").startswith("image/") or att.filename.lower().endswith(
-            IMAGE_EXTS
+        ctype = att.content_type or ""
+        return (
+            ctype.startswith("image/")
+            or att.filename.lower().endswith(IMAGE_EXTS)
+            or ctype in ("", "application/octet-stream")
         )
+
+    def _sources(self, message: discord.Message, *, embeds: bool = True) -> List[Source]:
+        """Images we can read from a message: attachments first, else embeds (optional), else components.
+
+        Automatic spawn detection passes embeds=False: embeds are info cards (e.g. a collection
+        thumbnail), not spawns.
+        """
+        found = [
+            Source("attachment", a.url, a.filename, a)
+            for a in message.attachments
+            if self._is_image(a)
+        ]
+        if found:
+            return found
+        for emb in message.embeds if embeds else []:
+            for kind, part in (("embed image", emb.image), ("embed thumbnail", emb.thumbnail)):
+                url = getattr(part, "proxy_url", None) or getattr(part, "url", None)
+                if url:
+                    found.append(Source(kind, url, _name_from_url(url)))
+        media: List[Tuple[str, str]] = []
+        _walk(message.components, media, [])
+        found.extend(Source("component", url, name) for url, name in media)
+        return found
+
+    async def _fetch(self, src: Source) -> bytes:
+        try:
+            if src.attachment is not None:
+                if src.attachment.size > MAX_BYTES:
+                    raise FetchError("image too large")
+                return await src.attachment.read()
+            # Only Discord's own CDN/proxy hosts, so a crafted embed can't make the bot fetch arbitrary URLs.
+            if self._session is None or not _is_discord_url(src.url):
+                raise FetchError("image isn't hosted on Discord")
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with self._session.get(src.url, timeout=timeout) as resp:
+                if resp.status != 200:
+                    raise FetchError(f"HTTP {resp.status}")
+                buf = bytearray()
+                async for chunk in resp.content.iter_chunked(65536):
+                    buf += chunk
+                    if len(buf) > MAX_BYTES:
+                        raise FetchError("image too large")
+                return bytes(buf)
+        except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            raise FetchError(str(e) or type(e).__name__) from e
+
+    async def _referenced(self, ctx: commands.Context) -> Optional[discord.Message]:
+        """The message the command message replies to, if it can be read."""
+        ref = ctx.message.reference
+        if ref is None:
+            return None
+        if isinstance(ref.resolved, discord.Message):
+            return ref.resolved
+        if ref.message_id is None:
+            return None
+        try:
+            return await ctx.channel.fetch_message(ref.message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
 
     async def _get_image(self, ctx: commands.Context) -> Optional[Tuple[bytes, str]]:
         """Image from the command message, or from the message it replies to."""
-        msg = ctx.message
-        attachments = list(msg.attachments)
-        if not attachments and msg.reference:
-            ref = msg.reference.resolved
-            if not isinstance(ref, discord.Message) and msg.reference.message_id:
-                try:
-                    ref = await ctx.channel.fetch_message(msg.reference.message_id)
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    ref = None
-            if isinstance(ref, discord.Message):
-                attachments = list(ref.attachments)
-        att = next((a for a in attachments if self._is_image(a)), None)
-        if att is None:
-            await ctx.send("Attach an image, or reply to a message that has one.")
-            return None
-        if att.size > MAX_BYTES:
-            await ctx.send(f"That image is too large (limit {MAX_BYTES // 1024 // 1024} MB).")
+        sources = self._sources(ctx.message)
+        replied = False
+        if not sources and ctx.message.reference:
+            replied = True
+            ref = await self._referenced(ctx)
+            if ref is None:
+                await ctx.send(
+                    "I couldn't read the message you replied to (I need Read Message History there)."
+                )
+                return None
+            sources = self._sources(ref)
+        if not sources:
+            if replied:
+                await ctx.send(
+                    f"That message has no image I can read. Run `{ctx.clean_prefix}ballping inspect` "
+                    "as a reply to it to see what it contains."
+                )
+            else:
+                await ctx.send("Attach an image, or reply to a message that has one.")
             return None
         try:
-            return await att.read(), att.filename
-        except (discord.HTTPException, discord.NotFound):
-            await ctx.send("I couldn't download that image.")
+            return await self._fetch(sources[0]), sources[0].filename
+        except FetchError as e:
+            await ctx.send(escape(f"I couldn't download that image ({e}).", mass_mentions=True))
             return None
+
+    async def _identify_message(self, message: discord.Message) -> Optional[Tuple[str, int]]:
+        """Best (name, diff) across up to three images in a message."""
+        best: Optional[Tuple[str, int]] = None
+        for src in self._sources(message, embeds=False)[:3]:
+            try:
+                results = self._match(await self._hash(await self._fetch(src)))
+            except (FetchError, BadImage) as e:
+                log.debug("Skipping %s in message %s: %s", src.kind, message.id, e)
+                continue
+            if results and (best is None or results[0][1] < best[1]):
+                best = results[0]
+        return best
 
     @staticmethod
     def _mentions(entry: Optional[dict]) -> str:
@@ -213,9 +355,9 @@ class BallPing(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        if message.guild is None or not message.author.bot or not message.attachments:
+        if message.guild is None or not message.author.bot or self._index is None:
             return
-        if message.author.id == self.bot.user.id or self._index is None:
+        if message.author.id == self.bot.user.id or _is_interaction_response(message):
             return
         if await self.bot.cog_disabled_in_guild(self, message.guild):
             return
@@ -224,21 +366,11 @@ class BallPing(commands.Cog):
             return
         if conf["channels"] and message.channel.id not in conf["channels"]:
             return
-        att = next(
-            (a for a in message.attachments if self._is_image(a) and a.size <= MAX_BYTES), None
-        )
-        if att is None:
-            return
-        try:
-            data = await att.read()
-            results = self._match(await self._hash(data))
-        except (discord.HTTPException, discord.NotFound, BadImage) as e:
-            log.debug("Could not process spawn image in %s: %s", message.guild.id, e)
-            return
-        if not results:
+        best = await self._identify_message(message)
+        if best is None:
             return
 
-        name, diff = results[0]
+        name, diff = best
         match_pct = 100 - diff
         if diff > conf["max_diff"]:
             if not conf["announce_all"]:
@@ -478,6 +610,64 @@ class BallPing(commands.Cog):
         lines = [f"{i}. **{n}**: {100 - d}% match (diff {d})" for i, (n, d) in enumerate(results, 1)]
         verdict = "Would be accepted." if results and results[0][1] <= max_diff else "Below the match threshold."
         await ctx.send(escape("\n".join(lines) + f"\n{verdict}", mass_mentions=True))
+
+    @ballping.command(name="inspect")
+    async def ballping_inspect(self, ctx: commands.Context):
+        """Reply to a spawn message with this to see what image data I can find in it."""
+        if not ctx.message.reference:
+            await ctx.send("Reply to the spawn message with this command.")
+            return
+        msg = await self._referenced(ctx)
+        if msg is None:
+            await ctx.send("I couldn't read that message (I need Read Message History there).")
+            return
+        conf = await self.config.guild(ctx.guild).all()
+        media: List[Tuple[str, str]] = []
+        names: List[str] = []
+        _walk(msg.components, media, names)
+        sources = self._sources(msg)
+        spawn_sources = self._sources(msg, embeds=False)
+        embeds = [
+            f"image={'yes' if getattr(e.image, 'url', None) else 'no'}, "
+            f"thumbnail={'yes' if getattr(e.thumbnail, 'url', None) else 'no'}"
+            for e in msg.embeds
+        ]
+        listed = msg.author.id in conf["spawn_bots"]
+        chan_ok = not conf["channels"] or msg.channel.id in conf["channels"]
+        slash = _is_interaction_response(msg)
+        reasons = []
+        if not msg.author.bot:
+            reasons.append("author isn't a bot")
+        if not listed:
+            reasons.append(f"author isn't a spawn bot here (use `{ctx.clean_prefix}ballping spawnbot add`)")
+        if not conf["enabled"]:
+            reasons.append("BallPing is disabled in this server")
+        if not chan_ok:
+            reasons.append("channel isn't in the allowed list")
+        if slash:
+            reasons.append("it's a slash-command/button response, which is ignored")
+        if not spawn_sources:
+            reasons.append("no attached or layout image (embed images are ignored)")
+        lines = [
+            f"Author: {msg.author} ({msg.author.id}), bot: {msg.author.bot}",
+            f"Listed as a spawn bot: {listed}",
+            f"Channel allowed: {chan_ok}",
+            f"Slash-command/button response: {slash}",
+            f"Attachments: {len(msg.attachments)} "
+            + ", ".join(f"{a.filename} [{a.content_type}]" for a in msg.attachments),
+            f"Embeds: {len(msg.embeds)} " + "; ".join(embeds),
+            f"Components: {', '.join(names) if names else 'none'}",
+            f"Images readable (for {ctx.clean_prefix}ballping test/art): {len(sources)}",
+            f"Would be detected as a spawn: {not reasons}",
+        ]
+        if reasons:
+            lines.append("Why not: " + "; ".join(reasons) + ".")
+        if not sources and not msg.attachments and not msg.embeds and not names:
+            lines.append(
+                "I see nothing at all on that message. If you can see an image on it, the bot's "
+                "Message Content intent may be off."
+            )
+        await ctx.send(escape("\n".join(lines), mass_mentions=True))
 
     # ---------------------------------------------------------- art (global)
 
